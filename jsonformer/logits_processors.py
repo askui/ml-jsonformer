@@ -3,9 +3,12 @@ from transformers import PreTrainedTokenizer, LogitsWarper, StoppingCriteria
 import torch
 
 class StringStoppingCriteria(StoppingCriteria):
-    def __init__(self, tokenizer: PreTrainedTokenizer, prompt_length: int):
+    def __init__(self, tokenizer: PreTrainedTokenizer, prompt_length: int, ignore_first_quote=False):
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
+        self.quote_threshold = 1 if ignore_first_quote else 0
+
+        self.num_observed_quotes = 0
 
     def __call__(
         self,
@@ -19,8 +22,12 @@ class StringStoppingCriteria(StoppingCriteria):
         last_token = self.tokenizer.decode(last_token_id, skip_special_tokens=True)
 
         result = '"' in last_token
+        if result:
+            self.num_observed_quotes += 1
 
-        return result
+        final_result = self.num_observed_quotes > self.quote_threshold
+
+        return final_result
 
 
 class NumberStoppingCriteria(StoppingCriteria):

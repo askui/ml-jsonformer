@@ -28,10 +28,10 @@ class Jsonformer:
         cross_images: torch.Tensor,
         *,
         debug: bool = False,
-        max_array_length: int = 10,
-        max_number_tokens: int = 6,
+        max_array_length: int = 20,
+        max_number_tokens: int = 10,
         temperature: float = 1.0,
-        max_string_token_length: int = 10,
+        max_string_token_length: int = 20,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -112,8 +112,8 @@ class Jsonformer:
 
         return result.item()
 
-    def generate_string(self) -> str:
-        model_inputs = self.get_inputs(is_string=True)
+    def generate_string(self, first_element_in_array: bool = False) -> str:
+        model_inputs = self.get_inputs(is_string=True, first_element_in_array=first_element_in_array)
         # self.debug("[generate_string]", prompt, is_prompt=True)
         # input_tokens = self.tokenizer.encode(prompt, return_tensors="pt").to(
         #     self.model.device
@@ -126,7 +126,7 @@ class Jsonformer:
             num_return_sequences=1,
             temperature=self.temperature,
             stopping_criteria=[
-                StringStoppingCriteria(self.tokenizer, len(input_tokens[0]))
+                StringStoppingCriteria(self.tokenizer, len(input_tokens[0]), first_element_in_array)
             ],
             pad_token_id=self.tokenizer.eos_token_id,
         )
@@ -147,9 +147,18 @@ class Jsonformer:
         self.debug("[generate_string]", "|" + response + "|")
 
         if response.count('"') < 1:
-            return response
+            if first_element_in_array:
+                # this is weird and should not happen. Possible scenarios are that a 'null' is returned.
+                if response[:4] == 'null':
+                    return ""
+                else:
+                    raise ValueError('bad string')
+            else:
+                return response
 
-        return response.split('"')[0].strip()
+        # if there is at least one quote, we want the content of the last pair of quotes.
+        return response.split('"')[-2].strip()
+
 
     def generate_object(
         self, properties: Dict[str, Any], obj: Dict[str, Any]
@@ -164,6 +173,7 @@ class Jsonformer:
         schema: Dict[str, Any],
         obj: Union[Dict[str, Any], List[Any]],
         key: Union[str, None] = None,
+        first_element_in_array: bool = False,
     ) -> Any:
         schema_type = schema["type"]
         if schema_type == "number":
@@ -183,7 +193,7 @@ class Jsonformer:
                 obj[key] = self.generation_marker
             else:
                 obj.append(self.generation_marker)
-            return self.generate_string()
+            return self.generate_string(first_element_in_array=first_element_in_array)
         elif schema_type == "array":
             new_array = []
             obj[key] = new_array
@@ -199,14 +209,20 @@ class Jsonformer:
             raise ValueError(f"Unsupported schema type: {schema_type}")
 
     def generate_array(self, item_schema: Dict[str, Any], obj: Dict[str, Any]) -> list:
-        for _ in range(self.max_array_length):
+        for i in range(self.max_array_length):
             # forces array to have at least one element
-            element = self.generate_value(item_schema, obj)
-            obj[-1] = element
+            element = self.generate_value(item_schema, obj, first_element_in_array=True)
+            if i > 0 or element != '':
+                obj[-1] = element
+
+            print(element)
+            print(obj)
 
             obj.append(self.generation_marker)
-            model_inputs = self.get_inputs()
+            print(obj)
+            model_inputs = self.get_inputs(is_array=True)
             obj.pop()
+            print(obj)
             # input_tensor = self.tokenizer.encode(input_prompt, return_tensors="pt")
             output = self.model.forward(**model_inputs)
             logits = output.logits[0, -1]
@@ -219,11 +235,12 @@ class Jsonformer:
 
             for token_id in sorted_token_ids:
                 decoded_token = self.tokenizer.decode(token_id)
-                if "," in decoded_token:
-                    found_comma = True
-                    break
+                cprint(decoded_token, "blue")
                 if "]" in decoded_token:
                     found_close_bracket = True
+                    break
+                if "," in decoded_token:
+                    found_comma = True
                     break
 
             if found_close_bracket or not found_comma:
@@ -231,21 +248,26 @@ class Jsonformer:
 
         return obj
 
-    def get_inputs(self, is_string: bool = False):
+    def get_inputs(self, is_string: bool = False, is_array: bool=False, first_element_in_array: bool=False):
         template = """{prompt}\nOutput result in the following JSON schema format:\n{schema}\nResult: {progress}"""
         progress = json.dumps(self.value)
-        gen_marker_index = progress.find(f'"{self.generation_marker}"')
+        gm = f'"{self.generation_marker}"'
+        if is_array:
+            gm = ', ' + gm  # remove comma to allow for empty arrays or single element arrays
+        gen_marker_index = progress.find(gm)
         if gen_marker_index != -1:
             progress = progress[:gen_marker_index]
         else:
             raise ValueError("Failed to find generation marker")
+
+        cprint(progress, "red")
 
         prompt = template.format(
             prompt=self.prompt,
             schema=json.dumps(self.json_schema),
             progress=progress,
         )
-        if is_string:
+        if is_string and not first_element_in_array:
             prompt += '"'
 
         image_size = 224  # taken from config.json
@@ -269,17 +291,17 @@ class Jsonformer:
         token_type_ids += [LANGUAGE_TOKEN_TYPE] * len(text_ids)
         attention_mask = [1] * len(input_ids)
 
-        input_ids += [self.tokenizer.eos_token_id]
-        token_type_ids += [LANGUAGE_TOKEN_TYPE]
-        attention_mask += [1]
+        # input_ids += [self.tokenizer.eos_token_id]
+        # token_type_ids += [LANGUAGE_TOKEN_TYPE]
+        # attention_mask += [1]
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
 
         return {
-            "input_ids": input_ids,
-            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
+            "input_ids": input_ids.unsqueeze(0),
+            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long).unsqueeze(0),
             # "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "cross_attention_mask": torch.ones((1, 1, 1)),
+            # "cross_attention_mask": torch.ones((1, 1, 1)),
             "images": images,
             "cross_images": cross_images,
         }
