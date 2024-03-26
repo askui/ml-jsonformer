@@ -50,11 +50,20 @@ class Jsonformer:
         self.temperature = temperature
         self.max_string_token_length = max_string_token_length
 
-    def debug(self, caller: str, value: str, is_prompt: bool = False):
+    def debug(self, caller: str, value: str, type: str = 'prompt'):
         if self.debug_on:
-            if is_prompt:
+            if type == 'prompt':
                 cprint(caller, "green", end=" ")
                 cprint(value, "yellow")
+            elif type == 'result':
+                cprint(caller, "green", end=" ")
+                cprint(value, "blue")
+            elif type == 'progress':
+                cprint(caller, "green", end=" ")
+                cprint(value, "red")
+            elif type == 'value':
+                cprint(caller, "green", end=" ")
+                cprint(value, "magenta")
             else:
                 cprint(caller, "green", end=" ")
                 cprint(value, "blue")
@@ -193,7 +202,8 @@ class Jsonformer:
                 obj[key] = self.generation_marker
             else:
                 obj.append(self.generation_marker)
-            return self.generate_string(first_element_in_array=first_element_in_array)
+            # return self.generate_string(first_element_in_array=first_element_in_array)
+            return self.generate_string(first_element_in_array=False)
         elif schema_type == "array":
             new_array = []
             obj[key] = new_array
@@ -208,42 +218,86 @@ class Jsonformer:
         else:
             raise ValueError(f"Unsupported schema type: {schema_type}")
 
+    def array_reached_end(self, obj, first=False, contentful_char_set=None):
+        if contentful_char_set is None:
+            contentful_char_set = set()
+
+        model_inputs = self.get_inputs(is_array=True, first_element_in_array=first)
+        obj.pop()
+        self.debug('<obj>', obj)
+
+        output = self.model.forward(**model_inputs)
+        logits = output.logits[0, -1]
+
+        top_indices = logits.topk(30).indices
+        sorted_token_ids = top_indices[logits[top_indices].argsort(descending=True)]
+
+
+        for token_id in sorted_token_ids:
+            decoded_token = self.tokenizer.decode(token_id)
+            self.debug('<decoded token>', decoded_token)
+            content_char_index = braket_index = comma_index = len(decoded_token)
+
+            if "]" in decoded_token:
+                self.debug('found', ']')
+                braket_index = decoded_token.index(']')
+                self.debug('at', braket_index)
+
+            for char in contentful_char_set:
+                self.debug('testing for', char)
+                if char in decoded_token:
+                    self.debug('found', char)
+                    content_char_index = min(content_char_index, decoded_token.index(char))
+                    self.debug('at', content_char_index)
+
+            if ',' in decoded_token:
+                self.debug('found', ',')
+                comma_index = decoded_token.index(',')
+                self.debug('at', comma_index)
+
+            # prioritization:
+            # whatever comes first counting from the start of the string has precedence
+            # A ']' means we are done, otherwise we are not!
+            if braket_index < comma_index and braket_index < content_char_index:
+                self.debug('{braket < comma & content} | b, c, c', (braket_index, comma_index, content_char_index))
+                return True
+            if comma_index < braket_index:
+                self.debug('{braket < comma} | b, c, c', (braket_index, comma_index, content_char_index))
+                return False
+            if content_char_index < braket_index:
+                self.debug('{braket < content} | b, c, c', (braket_index, comma_index, content_char_index))
+                return False
+
+        return False
+
     def generate_array(self, item_schema: Dict[str, Any], obj: Dict[str, Any]) -> list:
+        self.debug('obj at start', obj)
+
+        obj.append(self.generation_marker)
+        item_type = item_schema['type']
+        if item_type == 'string':
+            contentful_char_set = ('"',)
+        elif item_type == 'number':
+            contentful_char_set = set('1234567890'.split())
+        elif item_type == 'array':
+            contentful_char_set = ('[',)
+        elif item_type == 'object':
+            contentful_char_set = ('{',)
+        elif item_type == 'boolean':
+            contentful_char_set = ('T', 'F',)
+
+        if self.array_reached_end(obj, first=True, contentful_char_set=contentful_char_set):
+            return obj
+
         for i in range(self.max_array_length):
             # forces array to have at least one element
             element = self.generate_value(item_schema, obj, first_element_in_array=True)
-            if i > 0 or element != '':
-                obj[-1] = element
-
-            print(element)
-            print(obj)
-
+            obj[-1] = element
             obj.append(self.generation_marker)
-            print(obj)
-            model_inputs = self.get_inputs(is_array=True)
-            obj.pop()
-            print(obj)
-            # input_tensor = self.tokenizer.encode(input_prompt, return_tensors="pt")
-            output = self.model.forward(**model_inputs)
-            logits = output.logits[0, -1]
 
-            top_indices = logits.topk(30).indices
-            sorted_token_ids = top_indices[logits[top_indices].argsort(descending=True)]
-
-            found_comma = False
-            found_close_bracket = False
-
-            for token_id in sorted_token_ids:
-                decoded_token = self.tokenizer.decode(token_id)
-                cprint(decoded_token, "blue")
-                if "]" in decoded_token:
-                    found_close_bracket = True
-                    break
-                if "," in decoded_token:
-                    found_comma = True
-                    break
-
-            if found_close_bracket or not found_comma:
+            self.debug('<element>', element)
+            self.debug('<object>', obj)
+            if self.array_reached_end(obj, first=False):
                 break
 
         return obj
@@ -252,23 +306,27 @@ class Jsonformer:
         template = """{prompt}\nOutput result in the following JSON schema format:\n{schema}\nResult: {progress}"""
         progress = json.dumps(self.value)
         gm = f'"{self.generation_marker}"'
-        if is_array:
+        if is_array and not first_element_in_array:
             gm = ', ' + gm  # remove comma to allow for empty arrays or single element arrays
         gen_marker_index = progress.find(gm)
         if gen_marker_index != -1:
             progress = progress[:gen_marker_index]
         else:
+            self.debug('[value]', self.value, 'value')
+            self.debug('[progress]', progress, 'progress')
             raise ValueError("Failed to find generation marker")
+        if is_string and not first_element_in_array:
+            progress += '"'
 
-        cprint(progress, "red")
+        self.debug('[progress]', progress, "progress")
 
         prompt = template.format(
             prompt=self.prompt,
             schema=json.dumps(self.json_schema),
             progress=progress,
         )
-        if is_string and not first_element_in_array:
-            prompt += '"'
+
+        self.debug('[prompt]', prompt, "prompt")
 
         image_size = 224  # taken from config.json
         patch_size = 14  # taken from config.json
@@ -290,10 +348,6 @@ class Jsonformer:
         input_ids += text_ids
         token_type_ids += [LANGUAGE_TOKEN_TYPE] * len(text_ids)
         attention_mask = [1] * len(input_ids)
-
-        # input_ids += [self.tokenizer.eos_token_id]
-        # token_type_ids += [LANGUAGE_TOKEN_TYPE]
-        # attention_mask += [1]
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
 
